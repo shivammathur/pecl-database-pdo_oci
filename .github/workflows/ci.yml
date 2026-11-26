@@ -9,11 +9,13 @@ on:
 
 jobs:
   linux:
+    name: linux (${{ matrix.version }}, ${{ matrix.oracle }}${{ matrix.asan && ', ASAN' || '' }})
     strategy:
       fail-fast: false
       matrix:
         version: [8.3, 8.4, 8.5, 8.6, master]
         oracle: [18, 21, 23]
+        asan: [false]
         include:
           # Test Oracle 11 with PHP 8.3 only
           # https://github.com/php/php-src/pull/18734
@@ -34,6 +36,12 @@ jobs:
           - oracle: 23
             image: gvenzl/oracle-free:23-slim
             port: 1523
+            options: --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 10
+          - version: 8.5
+            oracle: 21
+            asan: true
+            image: gvenzl/oracle-xe:21-slim-faststart
+            port: 1521
             options: --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 10
     
     services:
@@ -62,17 +70,19 @@ jobs:
           echo DISABLE_INTERRUPT=on > /opt/oracle/instantclient/network/admin/sqlnet.ora
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Checkout php-src
-        uses: actions/checkout@v6
-        with:
-          repository: php/php-src
-          ref: ${{ matrix.version == 'master' && 'master' || format('PHP-{0}', matrix.version) }}
-          path: php-src
       - name: Setup PHP
         id: setup-php
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@develop
         with:
           php-version: ${{matrix.version}}
+          extensions: ${{ matrix.asan && 'none, pdo, mbstring, simplexml' || '' }}
+        env:
+          asan: ${{ matrix.asan }}
+      - name: Set ASAN build flags
+        if: matrix.asan
+        run: |
+          echo 'CFLAGS=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' >> "$GITHUB_ENV"
+          echo 'LDFLAGS=-fsanitize=address,undefined' >> "$GITHUB_ENV"
       - name: Build
         run: |
           phpize
@@ -80,17 +90,32 @@ jobs:
           make -j$(nproc)
           sudo make install
           version=$(php-config --version | cut -d. -f1,2)
+          if [[ -s "/etc/php/$version/COMMIT" ]]; then
+            echo "PHP_SRC_COMMIT=$(cat "/etc/php/$version/COMMIT")" >> "$GITHUB_ENV"
+          fi
           echo 'extension=pdo_oci.so' | sudo tee "/etc/php/$version/mods-available/pdo_oci.ini"
           sudo phpenmod -v "$version" pdo_oci
           php --ri pdo_oci
+      - name: Verify ASAN instrumentation
+        if: matrix.asan
+        run: |
+          [[ $(php-config --extension-dir) == *-asan ]]
+          nm -D modules/pdo_oci.so | grep ' U __asan_report_' > /dev/null
+      - name: Checkout php-src
+        uses: actions/checkout@v6
+        with:
+          repository: php/php-src
+          ref: ${{ env.PHP_SRC_COMMIT || format('php-{0}', steps.setup-php.outputs.php-version) }}
+          path: php-src
       - name: Remove unsupported php-src tests
         run: |
           # Test gh20553.phpt is not compatible with Oracle.
           # SELECT <literals> without a FROM clause is not supported in Oracle (ORA-00923).
           rm -rf php-src/ext/pdo/tests/gh20553.phpt
       - name: Run tests /w Oracle ${{ matrix.oracle }}
-        run: php php-src/run-tests.php --show-diff --show-slow 1000 --set-timeout 120 tests
+        run: php php-src/run-tests.php ${{ matrix.asan && '--asan' || '' }} --show-diff --show-slow 1000 --set-timeout 120 tests
         env:
+          ASAN_OPTIONS: ${{ matrix.asan && 'detect_leaks=1' || env.ASAN_OPTIONS }}
           PDO_TEST_DIR: ${{ github.workspace }}/php-src/ext/pdo/tests
           PDO_OCI_TEST_DIR: ${{ github.workspace }}/tests
           PDO_OCI_TEST_USER: system
